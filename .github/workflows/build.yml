@@ -414,4 +414,84 @@ jobs:
           name: ReCode debug build ${{ github.run_number }}
           body_path: release-notes.md
           prerelease: true
-          fail_on_unmat
+          fail_on_unmatched_files: true
+          files: |
+            dist/ReCode-debug.apk
+            dist/ReCode-debug.apk.sha256
+            dist/ReCode-debug.zip
+            dist/ReCode-debug.apk.part*
+            dist/parts.sha256
+            dist/get-recode.sh
+
+      - name: Verify release download checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="recode-build-${GITHUB_RUN_NUMBER}"
+          for i in 1 2 3 4 5; do
+            rm -rf check && mkdir check
+            if gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+              -p "$APK_NAME" -p "$APK_NAME.sha256" -D check \
+              && (cd check && sha256sum -c "$APK_NAME.sha256"); then
+              echo "Release round-trip checksum OK"; exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Release APK checksum verification failed"
+          exit 1
+
+      - name: Job summary
+        shell: bash
+        run: |
+          TAG="recode-build-${GITHUB_RUN_NUMBER}"
+          HASH=$(cut -d' ' -f1 "dist/$APK_NAME.sha256")
+          {
+            echo '## ReCode APK ready'
+            echo
+            echo "minSdk ${APK_MINSDK} (Android 10+) | arm64-v8a | llama.cpp ${LLAMA_REF} @ ${LLAMA_SHA} | NDK ${NDK_VERSION}"
+            echo
+            echo "SHA256: $HASH"
+            echo
+            echo "Signing key: ${APK_SIGNER:-unknown} (must stay the same between builds to install as an update)"
+            echo
+            echo "Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
+            echo
+            echo 'Termux:'
+            echo '```sh'
+            echo 'pkg install wget -y'
+            echo "wget https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/get-recode.sh"
+            echo 'sh get-recode.sh'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show useful build errors
+        if: failure()
+        shell: bash
+        run: |
+          [[ -f build.log ]] || exit 0
+          # first real compiler/linker errors, long command lines cut short
+          grep -nE 'error:|fatal error|undefined reference|undeclared|FAILED:|What went wrong|CMake Error' build.log \
+            | grep -v 'Werror' | cut -c1-260 | head -40 > first-errors.txt || true
+          cat first-errors.txt
+          {
+            echo '## Build failed - first errors'
+            echo '```'
+            cat first-errors.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-log
+          path: |
+            build.log
+            first-errors.txt
+            badging.txt
+            manifest-tree.txt
+          retention-days: 7
+          if-no-files-found: ignore
+
