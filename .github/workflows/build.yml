@@ -1,4 +1,4 @@
-name: Build APK
+name: ReCode V17 - Build and Verify APK
 
 on:
   workflow_dispatch:
@@ -26,14 +26,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # Builds the HIGHEST-version zip in the repo (ReCode_v8.zip beats ReCode_v5.zip; other zips are ignored) after unzipping it into a
+      # Builds the HIGHEST-version zip in the repo (case-insensitive ReCode_VN.zip variants) after unzipping it into a
       # brand-new folder, so files left over from older versions can never get mixed in.
       # If the repo has no zip at all, the project folder that is already in the repo is used.
       - name: Locate project
         shell: bash
         run: |
           set -euo pipefail
-          Z=$(ls ./ReCode_v*.zip 2>/dev/null | sort -V | tail -n1 || true)
+          # Accept both ReCode_v17.zip and ReCode_V17.zip (case-insensitive).
+          Z=$(find . -maxdepth 1 -type f -iname 'ReCode_v*.zip' -printf '%f\\n' | sort -V | tail -n1 || true)
           ROOT=.
           if [[ -n "$Z" ]]; then
             echo "Using $Z"
@@ -44,13 +45,14 @@ jobs:
           fi
           S=$(find "$ROOT" -maxdepth 3 -name settings.gradle.kts -not -path '*/llama.cpp/*' | head -n1 || true)
           if [[ -z "$S" ]]; then
-            echo "::error::settings.gradle.kts not found. Put ReCode_vN.zip (or the project folder) in the repo."
+            echo "::error::settings.gradle.kts not found. Put ReCode_V17.zip (or the project folder) in the repo."
             exit 1
           fi
           D=$(cd "$(dirname "$S")" && pwd)
           test -f "$D/app/build.gradle.kts"
           echo "PROJECT_DIR=$D" >> "$GITHUB_ENV"
           echo "Project: $D"
+          test -s "$D/app/src/main/assets/www/js/v17-engine.js" || { echo "::error::This is not a ReCode V17 source tree"; exit 1; }
 
       # A fresh runner makes a NEW random debug key every build, so a new APK can not be
       # installed over the old one ("App not installed"). Use one fixed debug.keystore
@@ -212,6 +214,20 @@ jobs:
             n=$((n+1))
           done
           echo "Web UI OK: $n scripts parsed"
+
+      - name: Verify ReCode V17 workflow engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="$PROJECT_DIR/app/src/main/assets/www/js/v17-engine.js"
+          test -s "$V" || { echo "::error::V17 engine missing"; exit 1; }
+          for token in agent_dashboard queue_coding_task context_compact create_project_checkpoint restore_project_checkpoint automatic_apk_testing advanced_error_recovery zip_workspace_compress zip_workspace_extract; do
+            grep -q "$token" "$V" || { echo "::error::V17 tool missing: $token"; exit 1; }
+          done
+          for token in realTimeAgentDashboard liveCodingProgress advancedTaskQueue agentConflictResolution intelligentContextManagement automaticApkTesting advancedErrorRecovery fullProjectCheckpoints zipExtract zipCompress safeZipPathValidation; do
+            grep -q "$token" "$V" || { echo "::error::V17 capability missing: $token"; exit 1; }
+          done
+          echo "V17 engine contract OK"
 
       # The icon, adaptive/monochrome icon and splash screen live inside the
       # project (res/ + themes.xml). Fail early if anything is missing.
@@ -390,7 +406,7 @@ jobs:
         shell: bash
         run: |
           {
-            echo "ReCode debug build ${GITHUB_RUN_NUMBER}"
+            echo "ReCode V17 debug build ${GITHUB_RUN_NUMBER}"
             echo
             echo "- Android 10+ (minSdk ${APK_MINSDK}), arm64-v8a only"
             echo "- llama.cpp ref: ${LLAMA_REF} (commit ${LLAMA_SHA})"
@@ -402,7 +418,7 @@ jobs:
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ReCode-debug
+          name: ReCode-V17-debug
           path: dist/
           retention-days: 14
           if-no-files-found: error
@@ -411,7 +427,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: recode-build-${{ github.run_number }}
-          name: ReCode debug build ${{ github.run_number }}
+          name: ReCode V17 debug build ${{ github.run_number }}
           body_path: release-notes.md
           prerelease: true
           fail_on_unmatched_files: true
@@ -494,4 +510,3 @@ jobs:
             manifest-tree.txt
           retention-days: 7
           if-no-files-found: ignore
-
