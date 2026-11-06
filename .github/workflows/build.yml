@@ -188,7 +188,12 @@ jobs:
           # identical duplicate imports (e.g. TimeUnit twice in NativeToolbox.kt) -> keep the first one only
           fixed = 0
           for f in (pathlib.Path(os.environ['PROJECT_DIR']) / 'app/src/main/java').rglob('*.kt'):
-              lines = f.read_text().split('\n')
+              txt = f.read_text()
+              # Shizuku: Maven group is dev.rikka.shizuku, but the Kotlin/Java package is rikka.shizuku
+              fixed_txt = txt.replace('dev.rikka.shizuku.', 'rikka.shizuku.')
+              if fixed_txt != txt:
+                  f.write_text(fixed_txt); print('fixed Shizuku package in', f.name)
+              lines = fixed_txt.split('\n')
               seen, out = set(), []
               for l in lines:
                   if l.startswith('import '):
@@ -523,8 +528,8 @@ jobs:
         shell: bash
         run: |
           [[ -f build.log ]] || exit 0
-          # first real compiler/linker errors, long command lines cut short
-          grep -nE 'error:|fatal error|undefined reference|undeclared|FAILED:|What went wrong|CMake Error' build.log \
+          # first real compiler/linker errors (Kotlin errors start with "e: "), long command lines cut short
+          grep -nE 'error:|^e: |fatal error|undefined reference|undeclared|FAILED:|What went wrong|CMake Error' build.log \
             | grep -v 'Werror' | cut -c1-260 | head -40 > first-errors.txt || true
           cat first-errors.txt
           {
