@@ -24,27 +24,32 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
 
-      # Builds the HIGHEST-version zip in the repo (ReCode_v8.zip beats ReCode_v5.zip; other zips are ignored) after unzipping it into a
+      # Builds the HIGHEST-version zip in the repo (ReCode_V17.zip / ReCode_v17.zip beat v16; upper/lower case v both work; other zips are ignored) after unzipping it into a
       # brand-new folder, so files left over from older versions can never get mixed in.
       # If the repo has no zip at all, the project folder that is already in the repo is used.
       - name: Locate project
         shell: bash
         run: |
           set -euo pipefail
-          Z=$(ls ./ReCode_v*.zip 2>/dev/null | sort -V | tail -n1 || true)
+          Z=""
+          BEST=-1
+          while IFS= read -r f; do
+            n=$(basename "$f" | sed -nE 's/^ReCode_[vV]([0-9]+).*/\1/p')
+            if [[ -n "$n" ]] && (( 10#$n > BEST )); then BEST=$((10#$n)); Z="$f"; fi
+          done < <(find . -maxdepth 1 -type f -iname 'ReCode_v*.zip')
           ROOT=.
           if [[ -n "$Z" ]]; then
             echo "Using $Z"
             rm -rf _build_src
             mkdir _build_src
-            unzip -q -o "$Z" -d _build_src
+            unzip -q -o "$Z" -d _build_src || [[ $? -eq 1 ]]   # exit code 1 = harmless warnings only
             ROOT=_build_src
           fi
-          S=$(find "$ROOT" -maxdepth 3 -name settings.gradle.kts -not -path '*/llama.cpp/*' | head -n1 || true)
+          S=$(find "$ROOT" -maxdepth 4 -name settings.gradle.kts -not -path '*/llama.cpp/*' -not -path '*/_build_src/*/_build_src/*' | head -n1 || true)
           if [[ -z "$S" ]]; then
-            echo "::error::settings.gradle.kts not found. Put ReCode_vN.zip (or the project folder) in the repo."
+            echo "::error::settings.gradle.kts not found. Put ReCode_VN.zip (or the project folder) in the repo."
             exit 1
           fi
           D=$(cd "$(dirname "$S")" && pwd)
@@ -71,11 +76,10 @@ jobs:
             echo "::warning::debug.keystore not found - this APK gets a random signature; uninstall the old app before installing it."
           fi
 
-      - uses: actions/setup-java@v6
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
-          cache: gradle
 
       - uses: gradle/actions/setup-gradle@v6
         with:
@@ -174,16 +178,52 @@ jobs:
               s, n = re.subn(r'(\n\s*android\s*\{)', r'\1\n    packaging { jniLibs { useLegacyPackaging = true } }', s, count=1)
               if n != 1:
                   raise SystemExit('::error::could not find android { } block in app/build.gradle.kts')
+          # jgit / pdfbox / jsoup / shizuku ship overlapping META-INF files; without excludes mergeDebugJavaResource can fail
+          if 'excludes +=' not in s:
+              ex = 'packaging { resources { excludes += setOf("META-INF/DEPENDENCIES", "META-INF/LICENSE*", "META-INF/NOTICE*", "META-INF/INDEX.LIST", "META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA", "META-INF/{AL2.0,LGPL2.1}", "about.html", "plugin.properties") } }'
+              s, n = re.subn(r'(\n\s*android\s*\{)', lambda m: m.group(1) + '\n    ' + ex, s, count=1)
+              if n != 1:
+                  raise SystemExit('::error::could not find android { } block in app/build.gradle.kts')
           p.write_text(s)
+          # identical duplicate imports (e.g. TimeUnit twice in NativeToolbox.kt) -> keep the first one only
+          fixed = 0
+          for f in (pathlib.Path(os.environ['PROJECT_DIR']) / 'app/src/main/java').rglob('*.kt'):
+              lines = f.read_text().split('\n')
+              seen, out = set(), []
+              for l in lines:
+                  if l.startswith('import '):
+                      if l.strip() in seen:
+                          fixed += 1
+                          continue
+                      seen.add(l.strip())
+                  out.append(l)
+              if len(out) != len(lines):
+                  f.write_text('\n'.join(out)); print('deduped imports in', f.name)
+          print('duplicate imports removed:', fixed)
+          # more heap for Gradle + Kotlin daemon (jgit/pdfbox + llama.cpp native build on a 7 GB runner)
+          gp = pathlib.Path(os.environ['PROJECT_DIR']) / 'gradle.properties'
+          g = gp.read_text() if gp.exists() else ''
+          g = '\n'.join(l for l in g.split('\n') if not l.startswith(('org.gradle.jvmargs', 'kotlin.daemon.jvmargs')))
+          g = g.rstrip('\n') + '\norg.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8 -XX:+UseParallelGC\nkotlin.daemon.jvmargs=-Xmx3g\n'
+          gp.write_text(g)
           PY
-          grep -nE "minSdk|useLegacyPackaging" "$PROJECT_DIR/app/build.gradle.kts"
+          grep -nE "minSdk|useLegacyPackaging|excludes" "$PROJECT_DIR/app/build.gradle.kts"
+
+      - name: Read app version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VN=$(sed -nE 's/.*versionName *= *"([^"]+)".*/\1/p' "$PROJECT_DIR/app/build.gradle.kts" | head -n1)
+          VC=$(sed -nE 's/.*versionCode *= *([0-9]+).*/\1/p' "$PROJECT_DIR/app/build.gradle.kts" | head -n1)
+          echo "APP_VERSION=${VN:-unknown}" >> "$GITHUB_ENV"
+          echo "APP_VERSION_CODE=${VC:-?}" >> "$GITHUB_ENV"
+          echo "App version: ${VN:-unknown} (code ${VC:-?})"
 
       - name: Install Android SDK parts
         shell: bash
         run: |
           set -euo pipefail
           SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          test -x "$SDKM" || { echo "::error::Android sdkmanager not found at $SDKM"; exit 1; }
           need=()
           [[ -d "$ANDROID_HOME/platforms/android-35" ]]        || need+=("platforms;android-35")
           [[ -d "$ANDROID_HOME/build-tools/35.0.0" ]]          || need+=("build-tools;35.0.0")
@@ -208,13 +248,22 @@ jobs:
           set -euo pipefail
           W="$PROJECT_DIR/app/src/main/assets/www"
           test -s "$W/index.html" || { echo "::error::assets/www/index.html missing"; exit 1; }
-          shopt -s nullglob
-          scripts=("$W"/js/*.js)
-          n=${#scripts[@]}
-          for f in "${scripts[@]}"; do
+          n=0
+          for f in "$W"/js/*.js; do
             node --check "$f" || { echo "::error::JavaScript syntax error in $f"; exit 1; }
+            n=$((n+1))
           done
           echo "Web UI OK: $n scripts parsed"
+          # every script/css referenced by index.html must exist (v17-engine.js etc. are easy to forget)
+          while read -r ref; do
+            test -s "$W/$ref" || { echo "::error::index.html references missing file: $ref"; exit 1; }
+          done < <(grep -oE '(src|href)="(js|css)/[^"]+"' "$W/index.html" | sed -E 's/^(src|href)="//; s/"$//')
+          echo "index.html references OK"
+          python3 - <<'PY'
+          import os, xml.dom.minidom as m
+          m.parse(os.environ['PROJECT_DIR'] + '/app/src/main/AndroidManifest.xml')
+          print('AndroidManifest.xml is well-formed')
+          PY
 
       # The icon, adaptive/monochrome icon and splash screen live inside the
       # project (res/ + themes.xml). Fail early if anything is missing.
@@ -239,10 +288,8 @@ jobs:
       - name: Build debug APK
         shell: bash
         run: |
-          set -euo pipefail
+          set -o pipefail
           cd "$PROJECT_DIR"
-          command -v gradle >/dev/null || { echo "::error::Gradle executable is not available"; exit 1; }
-          gradle --version
           gradle --no-daemon --stacktrace assembleDebug 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
 
       - name: Verify APK and prepare downloads
@@ -395,7 +442,7 @@ jobs:
         shell: bash
         run: |
           {
-            echo "ReCode debug build ${GITHUB_RUN_NUMBER}"
+            echo "ReCode ${APP_VERSION} (versionCode ${APP_VERSION_CODE}) debug build ${GITHUB_RUN_NUMBER}"
             echo
             echo "- Android 10+ (minSdk ${APK_MINSDK}), arm64-v8a only"
             echo "- llama.cpp ref: ${LLAMA_REF} (commit ${LLAMA_SHA})"
@@ -407,4 +454,95 @@ jobs:
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7
         with:
-      
+          name: ReCode-debug
+          path: dist/
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: recode-build-${{ github.run_number }}
+          name: ReCode ${{ env.APP_VERSION }} debug build ${{ github.run_number }}
+          body_path: release-notes.md
+          prerelease: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/ReCode-debug.apk
+            dist/ReCode-debug.apk.sha256
+            dist/ReCode-debug.zip
+            dist/ReCode-debug.apk.part*
+            dist/parts.sha256
+            dist/get-recode.sh
+
+      - name: Verify release download checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="recode-build-${GITHUB_RUN_NUMBER}"
+          for i in 1 2 3 4 5; do
+            rm -rf check && mkdir check
+            if gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+              -p "$APK_NAME" -p "$APK_NAME.sha256" -D check \
+              && (cd check && sha256sum -c "$APK_NAME.sha256"); then
+              echo "Release round-trip checksum OK"; exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Release APK checksum verification failed"
+          exit 1
+
+      - name: Job summary
+        shell: bash
+        run: |
+          TAG="recode-build-${GITHUB_RUN_NUMBER}"
+          HASH=$(cut -d' ' -f1 "dist/$APK_NAME.sha256")
+          {
+            echo "## ReCode ${APP_VERSION} APK ready"
+            echo
+            echo "minSdk ${APK_MINSDK} (Android 10+) | arm64-v8a | llama.cpp ${LLAMA_REF} @ ${LLAMA_SHA} | NDK ${NDK_VERSION}"
+            echo
+            echo "SHA256: $HASH"
+            echo
+            echo "Signing key: ${APK_SIGNER:-unknown} (must stay the same between builds to install as an update)"
+            echo
+            echo "Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
+            echo
+            echo 'Termux:'
+            echo '```sh'
+            echo 'pkg install wget -y'
+            echo "wget https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/get-recode.sh"
+            echo 'sh get-recode.sh'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show useful build errors
+        if: failure()
+        shell: bash
+        run: |
+          [[ -f build.log ]] || exit 0
+          # first real compiler/linker errors, long command lines cut short
+          grep -nE 'error:|fatal error|undefined reference|undeclared|FAILED:|What went wrong|CMake Error' build.log \
+            | grep -v 'Werror' | cut -c1-260 | head -40 > first-errors.txt || true
+          cat first-errors.txt
+          {
+            echo '## Build failed - first errors'
+            echo '```'
+            cat first-errors.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-log
+          path: |
+            build.log
+            first-errors.txt
+            badging.txt
+            manifest-tree.txt
+          retention-days: 7
+          if-no-files-found: ignore
