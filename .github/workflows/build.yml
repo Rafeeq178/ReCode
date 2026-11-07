@@ -1,9 +1,5 @@
 name: Build ReCode (Harness) APK
 
-# Repo mein ReCode_Harness_v1.zip (ya v2, v3...) daalo aur main branch pe push karo.
-# Workflow sabse high version wali ReCode_Harness_v*.zip ko build karta hai.
-# Agar repo mein zip nahi hai to repo ka project folder hi build hota hai.
-
 on:
   workflow_dispatch:
   push:
@@ -25,7 +21,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
 
@@ -42,7 +38,7 @@ jobs:
             ROOT=_build_src
           fi
           S=$(find "$ROOT" -maxdepth 3 -name settings.gradle.kts | head -n1 || true)
-          [[ -n "$S" ]] || { echo "::error::settings.gradle.kts nahi mila. ReCode_Harness_vN.zip repo mein daalo."; exit 1; }
+          [[ -n "$S" ]] || { echo "::error::settings.gradle.kts nahi mila."; exit 1; }
           D=$(cd "$(dirname "$S")" && pwd)
           test -f "$D/app/build.gradle.kts"
           echo "PROJECT_DIR=$D" >> "$GITHUB_ENV"
@@ -54,7 +50,7 @@ jobs:
           if [[ -f "$PROJECT_DIR/signing-keys/debug.keystore" ]]; then
             echo "Using fixed debug keystore"
           else
-            echo "::warning::signing-keys/debug.keystore nahi mila - random key, purani app uninstall karni hogi."
+            echo "::warning::signing-keys/debug.keystore nahi mila - random key."
           fi
 
       - uses: actions/setup-java@v4
@@ -64,18 +60,6 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
-      - name: Limit to arm64-v8a
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          import os, re, pathlib
-          p = pathlib.Path(os.environ['PROJECT_DIR']) / 'app/build.gradle.kts'
-          s = p.read_text()
-          s = re.sub(r'abiFilters\s*\+=\s*listOf\([^)]*\)', 'abiFilters += listOf("arm64-v8a")', s)
-          p.write_text(s)
-          PY
-          grep -n "abiFilters" "$PROJECT_DIR/app/build.gradle.kts"
-
       - name: Install Android SDK parts
         shell: bash
         run: |
@@ -83,8 +67,8 @@ jobs:
           SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           yes | "$SDKM" --licenses > /dev/null 2>&1
           "$SDKM" "cmake;${CMAKE_VERSION}" "ndk;${NDK_VERSION}" | tail -n 3
-          test -d "$ANDROID_HOME/ndk/$NDK_VERSION" || { echo "::error::NDK $NDK_VERSION install nahi hua"; exit 1; }
-          test -d "$ANDROID_HOME/cmake/$CMAKE_VERSION" || { echo "::error::CMake $CMAKE_VERSION install nahi hua"; exit 1; }
+          test -d "$ANDROID_HOME/ndk/$NDK_VERSION" || { echo "::error::NDK install nahi hua"; exit 1; }
+          test -d "$ANDROID_HOME/cmake/$CMAKE_VERSION" || { echo "::error::CMake install nahi hua"; exit 1; }
           for pkg in "platforms;android-37.0" "platforms;android-37" "platforms;android-36" "build-tools;36.0.0"; do
             "$SDKM" "$pkg" > /dev/null 2>&1 && echo "installed $pkg" || echo "skip $pkg (Gradle download karega)"
           done
@@ -111,7 +95,6 @@ jobs:
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)
           "$BT/apksigner" verify --print-certs "$APK" | grep -E "Verifies|SHA-256" || true
           "$BT/aapt2" dump badging "$APK" | grep -E "^package:|^sdkVersion|^minSdkVersion|^native-code|^application-label:" || true
-          unzip -l "$APK" | grep -E 'lib/arm64-v8a/.*\.so' | head -20
           mkdir -p dist
           cp "$APK" "dist/$APK_NAME"
           cd dist
@@ -123,8 +106,6 @@ jobs:
           {
             echo "ReCode (Harness) debug build ${GITHUB_RUN_NUMBER}"
             echo
-            echo "- arm64-v8a, offline GGUF (llama.cpp) + API providers"
-            echo "- NDK ${NDK_VERSION}"
             echo "- SHA256: $(cut -d' ' -f1 "dist/$APK_NAME.sha256")"
           } > release-notes.md
 
