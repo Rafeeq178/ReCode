@@ -10,8 +10,8 @@ on:
     branches: [main, master]
 
 env:
-  NDK_VERSION: 27.2.12479018   # app/build.gradle.kts mein pinned
-  CMAKE_VERSION: 3.22.1        # app/build.gradle.kts mein pinned
+  NDK_VERSION: 27.2.12479018
+  CMAKE_VERSION: 3.22.1
   COMPILE_SDK: '37'
   APK_NAME: ReCode-debug.apk
 
@@ -48,7 +48,6 @@ jobs:
           echo "PROJECT_DIR=$D" >> "$GITHUB_ENV"
           echo "Project: $D"
 
-      # Fixed key: signing-keys/debug.keystore (zip ke andar hai) taake naya APK purane ke upar install ho.
       - name: Use fixed debug signing key
         shell: bash
         run: |
@@ -65,7 +64,6 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
-      # Sirf arm64 build karo: tez hai aur aaj ke phones ke liye kaafi hai.
       - name: Limit to arm64-v8a
         shell: bash
         run: |
@@ -81,12 +79,16 @@ jobs:
       - name: Install Android SDK parts
         shell: bash
         run: |
-          set -euo pipefail
+          set +e
           SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          yes | "$SDKM" --licenses >/dev/null || true
-          "$SDKM" "platforms;android-${COMPILE_SDK}" "platforms;android-36" "build-tools;36.0.0" \
-                  "cmake;${CMAKE_VERSION}" "ndk;${NDK_VERSION}" | tail -n 5
-          test -d "$ANDROID_HOME/ndk/$NDK_VERSION"
+          yes | "$SDKM" --licenses > /dev/null 2>&1
+          "$SDKM" "cmake;${CMAKE_VERSION}" "ndk;${NDK_VERSION}" | tail -n 3
+          test -d "$ANDROID_HOME/ndk/$NDK_VERSION" || { echo "::error::NDK $NDK_VERSION install nahi hua"; exit 1; }
+          test -d "$ANDROID_HOME/cmake/$CMAKE_VERSION" || { echo "::error::CMake $CMAKE_VERSION install nahi hua"; exit 1; }
+          for pkg in "platforms;android-37.0" "platforms;android-37" "platforms;android-36" "build-tools;36.0.0"; do
+            "$SDKM" "$pkg" > /dev/null 2>&1 && echo "installed $pkg" || echo "skip $pkg (Gradle download karega)"
+          done
+          exit 0
 
       - name: Install Vulkan shader compiler
         run: sudo apt-get update && sudo apt-get install -y glslc
