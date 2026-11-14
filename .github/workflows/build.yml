@@ -1,4 +1,4 @@
-name: Build ReCode (Harness) APK
+name: Build APK
 
 on:
   workflow_dispatch:
@@ -6,146 +6,506 @@ on:
     branches: [main, master]
 
 env:
-  NDK_VERSION: 27.2.12479018
-  CMAKE_VERSION: 3.22.1
-  COMPILE_SDK: '37'
-  APK_NAME: ReCode-debug.apk
+  LLAMA_REF: b11982            # pinned llama.cpp tag (LFM3 needs b11960+); falls back to master if the tag does not exist
+  NDK_VERSION: 29.0.13113456   # default only; the llama.cpp lib's own ndkVersion wins if it has one
+  CMAKE_VERSION: 3.31.6        # default only; the lib's own cmake version wins if it has one
+  MIN_SDK: '29'                # Android 10
+  APK_NAME: Vethos-debug.apk
 
 permissions:
   contents: write
 
 concurrency:
-  group: build-recode
+  group: build-apk
   cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
+      # Builds the HIGHEST-version zip in the repo (Vethos_v8.zip beats Vethos_v5.zip) after unzipping it into a
+      # brand-new folder, so files left over from older versions can never get mixed in.
+      # If the repo has no zip at all, the project folder that is already in the repo is used.
       - name: Locate project
         shell: bash
         run: |
           set -euo pipefail
-          Z=$(ls ./ReCode_Harness_v*.zip 2>/dev/null | sort -V | tail -n1 || true)
+          Z=$(ls ./*.zip 2>/dev/null | sort -V | tail -n1 || true)
           ROOT=.
           if [[ -n "$Z" ]]; then
             echo "Using $Z"
-            rm -rf _build_src && mkdir _build_src
+            rm -rf _build_src
+            mkdir _build_src
             unzip -q -o "$Z" -d _build_src
             ROOT=_build_src
           fi
-          S=$(find "$ROOT" -maxdepth 3 -name settings.gradle.kts | head -n1 || true)
-          [[ -n "$S" ]] || { echo "::error::settings.gradle.kts nahi mila."; exit 1; }
+          S=$(find "$ROOT" -maxdepth 3 -name settings.gradle.kts -not -path '*/llama.cpp/*' | head -n1 || true)
+          if [[ -z "$S" ]]; then
+            echo "::error::settings.gradle.kts not found. Put Vethos_vN.zip (or the project folder) in the repo."
+            exit 1
+          fi
           D=$(cd "$(dirname "$S")" && pwd)
           test -f "$D/app/build.gradle.kts"
           echo "PROJECT_DIR=$D" >> "$GITHUB_ENV"
           echo "Project: $D"
 
+      # A fresh runner makes a NEW random debug key every build, so a new APK can not be
+      # installed over the old one ("App not installed"). Use one fixed debug.keystore
+      # (put it in the repo root or next to settings.gradle.kts) so updates install over each other.
       - name: Use fixed debug signing key
         shell: bash
         run: |
-          if [[ -f "$PROJECT_DIR/signing-keys/debug.keystore" ]]; then
-            echo "Using fixed debug keystore"
+          set -euo pipefail
+          K=""
+          for c in "$PROJECT_DIR/debug.keystore" "debug.keystore"; do
+            [[ -f "$c" ]] && { K="$c"; break; }
+          done
+          if [[ -n "$K" ]]; then
+            mkdir -p "$HOME/.android"
+            cp "$K" "$HOME/.android/debug.keystore"
+            echo "Using fixed debug keystore: $K"
           else
-            echo "::warning::signing-keys/debug.keystore nahi mila - random key."
+            echo "::warning::debug.keystore not found - this APK gets a random signature; uninstall the old app before installing it."
           fi
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: '21'
+          java-version: '17'
 
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.9'
+
+      - name: Fetch llama.cpp
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEST="$PROJECT_DIR/llama.cpp"      # settings.gradle.kts expects it here
+          rm -rf "$DEST"
+          if git clone --depth 1 --branch "$LLAMA_REF" https://github.com/ggml-org/llama.cpp.git "$DEST"; then
+            echo "Fetched llama.cpp ref: $LLAMA_REF"
+          else
+            rm -rf "$DEST"
+            echo "::warning::LLAMA_REF '$LLAMA_REF' not found; using master (build may differ from last time)"
+            git clone --depth 1 https://github.com/ggml-org/llama.cpp.git "$DEST"
+          fi
+          git -C "$DEST" log -1 --oneline
+          echo "LLAMA_SHA=$(git -C "$DEST" rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
+          test -f "$DEST/examples/llama.android/lib/build.gradle.kts" || {
+            echo "::error::This llama.cpp ref has no examples/llama.android/lib module. Set LLAMA_REF to a newer tag or master."
+            exit 1
+          }
+
+      - name: Export llama.cpp lib source for review (non-blocking)
+        shell: bash
+        continue-on-error: true
+        run: |
+          python3 - <<'EOF'
+          import os, zipfile, pathlib
+          root = pathlib.Path(os.environ['PROJECT_DIR']) / 'llama.cpp'
+          out = pathlib.Path(os.environ['GITHUB_WORKSPACE']) / 'llama-lib-source.zip'
+          want = ['examples/llama.android/lib/src', 'examples/llama.android/lib/build.gradle.kts', 'tools/mtmd']
+          n = 0
+          with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
+              for w in want:
+                  base = root / w
+                  files = [base] if base.is_file() else [f for f in base.rglob('*') if f.is_file()]
+                  for f in files:
+                      if f.suffix.lower() in ('.cpp', '.h', '.hpp', '.kt', '.kts', '.txt', '.md', '.cmake', '.c', '.cc'):
+                          z.write(f, str(f.relative_to(root)))
+                          n += 1
+          print('exported files:', n, 'size:', out.stat().st_size)
+          EOF
+
+      - name: Upload lib source artifact (non-blocking)
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: llama-lib-source
+          path: llama-lib-source.zip
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Prepare llama.cpp Android lib
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, pathlib
+          p = pathlib.Path(os.environ['PROJECT_DIR']) / 'llama.cpp/examples/llama.android/lib/build.gradle.kts'
+          s = p.read_text()
+          # upstream uses a version catalog; swap it for plain ids/coordinates
+          s = s.replace('alias(libs.plugins.android.library)', 'id("com.android.library")')
+          s = re.sub(r'alias\(libs\.plugins\.(?:jetbrains\.)?kotlin\.android\)', 'id("org.jetbrains.kotlin.android")', s)
+          s = s.replace('libs.androidx.core.ktx', '"androidx.core:core-ktx:1.13.1"')
+          s = s.replace('libs.androidx.datastore.preferences', '"androidx.datastore:datastore-preferences:1.1.1"')
+          s = re.sub(r'^\s*(?:test|androidTest)Implementation\(libs\.[^\n]*\n', '', s, flags=re.M)
+          s = re.sub(r'compileSdk\s*=\s*\d+', 'compileSdk = 35', s)
+          s = re.sub(r'minSdk\s*=\s*\d+', 'minSdk = ' + os.environ['MIN_SDK'], s)   # Android 10+
+          s = re.sub(r'abiFilters\s*\+=\s*listOf\([^)]*\)', 'abiFilters += listOf("arm64-v8a")', s)
+          left = sorted(set(re.findall(r'libs\.[\w.]+', s)))
+          if left:
+              raise SystemExit('::error::unresolved version-catalog refs in lib/build.gradle.kts: ' + ', '.join(left))
+          p.write_text(s)
+          ndk = re.search(r'ndkVersion\s*=\s*"([^"]+)"', s)
+          cm = re.search(r'(?<![A-Za-z])version\s*=\s*"(\d+\.\d+[\d.]*)"', s)
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              if ndk: f.write('NDK_VERSION=' + ndk.group(1) + '\n')
+              if cm: f.write('CMAKE_VERSION=' + cm.group(1) + '\n')
+          print('lib patched. ndk =', ndk.group(1) if ndk else 'default', '| cmake =', cm.group(1) if cm else 'default')
+          PY
+
+      # llama.cpp's Android lib may call a few APIs newer than Android 10 (API 29).
+      # Replace them so the native code compiles and RUNS on minSdk 29.
+      - name: Patch lib native sources for Android 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, pathlib
+          root = pathlib.Path(os.environ['PROJECT_DIR']) / 'llama.cpp/examples/llama.android/lib/src/main/cpp'
+          # __android_log_is_loggable needs API 30 -> plain level check
+          pat = re.compile(r'__android_log_is_loggable\s*\(\s*([^,()]+?)\s*,[^;]*\)')
+          n = 0
+          for f in root.rglob('*'):
+              if f.suffix in ('.h', '.hpp', '.cpp', '.c', '.cc'):
+                  t = f.read_text(errors='ignore')
+                  t2 = pat.sub(r'((\1) >= ANDROID_LOG_INFO)', t)
+                  if t2 != t:
+                      f.write_text(t2); n += 1; print('patched', f)
+          print('files patched:', n)
+          PY
+          if grep -rn "__android_log_is_loggable" "$PROJECT_DIR/llama.cpp/examples/llama.android/lib/src/main/cpp"; then
+            echo "::error::__android_log_is_loggable still present"; exit 1
+          fi
+          echo "--- how upstream loads the CPU backends (for reference) ---"
+          grep -rn "nativeLibraryDir\|ggml_backend_load_all_from_path" "$PROJECT_DIR/llama.cpp/examples/llama.android/lib/src/main" || true
+
+      # llama.cpp is built with dynamically loaded CPU backends
+      # (libggml-cpu-android_armv8.*.so). They are dlopen()ed from the app's
+      # nativeLibraryDir, which is EMPTY unless native libs are extracted at
+      # install time. Newer AGP defaults to "not extracted", so force it.
+      # Also make sure the app itself targets minSdk 29.
+      - name: Patch app (minSdk + extract native libs)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, pathlib
+          p = pathlib.Path(os.environ['PROJECT_DIR']) / 'app/build.gradle.kts'
+          s = p.read_text()
+          s = re.sub(r'minSdk\s*=\s*\d+', 'minSdk = ' + os.environ['MIN_SDK'], s)
+          if 'useLegacyPackaging' not in s:
+              s, n = re.subn(r'(\n\s*android\s*\{)', r'\1\n    packaging { jniLibs { useLegacyPackaging = true } }', s, count=1)
+              if n != 1:
+                  raise SystemExit('::error::could not find android { } block in app/build.gradle.kts')
+          p.write_text(s)
+          PY
+          grep -nE "minSdk|useLegacyPackaging" "$PROJECT_DIR/app/build.gradle.kts"
 
       - name: Install Android SDK parts
         shell: bash
         run: |
-          set +e
+          set -euo pipefail
           SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          yes | "$SDKM" --licenses > /dev/null 2>&1
-          "$SDKM" "cmake;${CMAKE_VERSION}" "ndk;${NDK_VERSION}" | tail -n 3
-          test -d "$ANDROID_HOME/ndk/$NDK_VERSION" || { echo "::error::NDK install nahi hua"; exit 1; }
-          test -d "$ANDROID_HOME/cmake/$CMAKE_VERSION" || { echo "::error::CMake install nahi hua"; exit 1; }
-          for pkg in "platforms;android-37.0" "platforms;android-37" "platforms;android-36" "build-tools;36.0.0"; do
-            "$SDKM" "$pkg" > /dev/null 2>&1 && echo "installed $pkg" || echo "skip $pkg (Gradle download karega)"
-          done
-          exit 0
+          need=()
+          [[ -d "$ANDROID_HOME/platforms/android-35" ]]        || need+=("platforms;android-35")
+          [[ -d "$ANDROID_HOME/build-tools/35.0.0" ]]          || need+=("build-tools;35.0.0")
+          [[ -d "$ANDROID_HOME/cmake/$CMAKE_VERSION" ]]        || need+=("cmake;${CMAKE_VERSION}")
+          [[ -d "$ANDROID_HOME/ndk/$NDK_VERSION" ]]            || need+=("ndk;${NDK_VERSION}")
+          if (( ${#need[@]} )); then
+            echo "Installing: ${need[*]}"
+            yes | "$SDKM" --licenses >/dev/null || true
+            "$SDKM" "${need[@]}" | tail -n 5
+          else
+            echo "All SDK parts already on the runner image"
+          fi
+          test -d "$ANDROID_HOME/ndk/$NDK_VERSION"
+          test -d "$ANDROID_HOME/cmake/$CMAKE_VERSION"
+          echo "ndk ok: $NDK_VERSION | cmake ok: $CMAKE_VERSION"
 
-      - name: Install Vulkan shader compiler
-        run: sudo apt-get update && sudo apt-get install -y glslc
+      # The icon, adaptive/monochrome icon and splash screen live inside the
+      # project (res/ + themes.xml). Fail early if anything is missing.
+      - name: Check icon and splash resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          RES="$PROJECT_DIR/app/src/main/res"
+          M="$PROJECT_DIR/app/src/main/AndroidManifest.xml"
+          for f in mipmap-anydpi-v26/ic_launcher.xml mipmap-anydpi-v26/ic_launcher_round.xml drawable/ic_launcher_fg.xml values/colors.xml values/themes.xml; do
+            test -s "$RES/$f" || { echo "::error::missing $f"; exit 1; }
+          done
+          grep -q 'android:icon="@mipmap/ic_launcher"' "$M"
+          grep -q 'android:roundIcon="@mipmap/ic_launcher_round"' "$M"
+          grep -q 'Theme.Vethos.Starting' "$RES/values/themes.xml"
+          grep -q 'windowSplashScreenAnimatedIcon' "$RES/values/themes.xml"
+          grep -q 'Theme.Vethos.Starting' "$M"
+          grep -q 'windowSplashScreenBackground' "$RES/values/themes.xml"
+          grep -q '<monochrome' "$RES/mipmap-anydpi-v26/ic_launcher.xml"
+          echo "Icon + splash resources OK"
 
       - name: Build debug APK
         shell: bash
         run: |
           set -o pipefail
           cd "$PROJECT_DIR"
-          chmod +x gradlew
-          ./gradlew --no-daemon --stacktrace :app:assembleDebug 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          gradle --no-daemon --stacktrace assembleDebug 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
 
       - name: Verify APK and prepare downloads
         shell: bash
         run: |
           set -euo pipefail
-          APK=$(find "$PROJECT_DIR/app/build/outputs/apk/debug" -name '*.apk' | head -n1)
+          APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
+          BT="$ANDROID_HOME/build-tools/35.0.0"
           test -s "$APK"
           unzip -tq "$APK"
-          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)
-          "$BT/apksigner" verify --print-certs "$APK" | grep -E "Verifies|SHA-256" || true
-          "$BT/aapt2" dump badging "$APK" | grep -E "^package:|^sdkVersion|^minSdkVersion|^native-code|^application-label:" || true
+          "$BT/apksigner" verify --verbose --print-certs "$APK" | grep -E "Verifies|SHA-256|Signer #1 certificate DN" || true
+          SIGNER=$("$BT/apksigner" verify --print-certs "$APK" | sed -nE 's/.*certificate SHA-256 digest: ([0-9a-f]+).*/\1/p' | head -n1)
+          echo "APK_SIGNER=${SIGNER:0:16}" >> "$GITHUB_ENV"
+          "$BT/aapt2" dump badging "$APK" > badging.txt
+          "$BT/aapt2" dump xmltree --file AndroidManifest.xml "$APK" > manifest-tree.txt
+          grep -E "^package:|^(min)?[sS]dkVersion|^targetSdkVersion|^native-code|^launchable-activity" badging.txt || true
+
+          # aapt2 prints minSdkVersion:'N' (older aapt printed sdkVersion:'N'); accept both,
+          # fall back to the binary manifest. Anything <= 29 installs on Android 10.
+          MIN=$(sed -nE "s/^(minSdkVersion|sdkVersion):'([0-9]+)'.*/\2/p" badging.txt | head -n1)
+          if [[ -z "$MIN" ]]; then
+            MIN=$(sed -nE 's/.*minSdkVersion\(0x[0-9a-f]+\)=([0-9]+).*/\1/p' manifest-tree.txt | head -n1)
+          fi
+          echo "APK minSdk = ${MIN:-unknown}"
+          [[ -n "$MIN" ]] || { echo "::error::could not read minSdk from APK"; exit 1; }
+          (( MIN <= MIN_SDK )) || { echo "::error::APK minSdk is $MIN, Android 10 (API 29) will refuse to install it"; exit 1; }
+          echo "APK_MINSDK=$MIN" >> "$GITHUB_ENV"
+
+          grep -q "launchable-activity" badging.txt || { echo "::error::no launcher activity in APK"; exit 1; }
+          grep -q "application-icon.*ic_launcher" badging.txt || { echo "::error::launcher icon missing in APK"; exit 1; }
+          grep -q "native-code: *'arm64-v8a'" badging.txt || { echo "::error::APK is not arm64-v8a"; exit 1; }
+
+          # native libs must be extracted at install time, or the dlopen()ed CPU backends are not found
+          if grep -E "extractNativeLibs" manifest-tree.txt | grep -qE "=false|0x0$"; then
+            echo "::error::extractNativeLibs=false: llama.cpp CPU backends would not load on the phone"; exit 1
+          fi
+          grep -E "extractNativeLibs" manifest-tree.txt || echo "::warning::extractNativeLibs not set in manifest"
+
+          unzip -l "$APK" | grep -E 'lib/arm64-v8a/.*\.so' | head -30
+          unzip -l "$APK" | grep -qE 'lib/arm64-v8a/libai-chat\.so'    || { echo "::error::libai-chat.so missing"; exit 1; }
+          unzip -l "$APK" | grep -qE 'lib/arm64-v8a/libggml-cpu-.*\.so' || { echo "::error::no ggml CPU backend .so in APK"; exit 1; }
+          unzip -l "$APK" | grep -qE 'lib/arm64-v8a/libomp\.so'         || { echo "::error::libomp.so missing in APK"; exit 1; }
+
           mkdir -p dist
           cp "$APK" "dist/$APK_NAME"
           cd dist
           sha256sum "$APK_NAME" | tee "$APK_NAME.sha256"
+          split -b 3M -d -a 2 "$APK_NAME" "$APK_NAME.part"
+          sha256sum "$APK_NAME".part* > parts.sha256
+          zip -q -9 Vethos-debug.zip "$APK_NAME"
+          zip -T Vethos-debug.zip
+
+      # Extra Android 10 safety net (never fails the build): every symbol the
+      # native libs import must exist in Android 10's libc/libm/liblog/etc.
+      - name: Check native libs against Android 10 (API 29)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
+          LLVM="$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64"
+          SYS="$LLVM/sysroot/usr/lib/aarch64-linux-android"
+          rm -rf so && mkdir so && unzip -q -j "$APK" 'lib/arm64-v8a/*.so' -d so
+          : > defined.txt
+          for f in "$SYS"/29/*.so "$SYS"/libc++_shared.so so/*.so; do
+            "$LLVM/bin/llvm-nm" -D --defined-only "$f" 2>/dev/null | awk 'NF{print $NF}' | sed 's/@.*//' >> defined.txt
+          done
+          sort -u defined.txt -o defined.txt
+          bad=0
+          for f in so/*.so; do
+            miss=$("$LLVM/bin/llvm-nm" -D --undefined-only "$f" 2>/dev/null | awk '$1=="U"{print $2}' | sed 's/@.*//' | sort -u | comm -23 - defined.txt)
+            if [[ -n "$miss" ]]; then
+              bad=1
+              echo "::warning::$(basename "$f") imports symbols not found on API 29: $(echo "$miss" | head -n 8 | tr '\n' ' ')"
+            fi
+          done
+          [[ $bad == 0 ]] && echo "No API>29 native symbols found (good for Android 10)"
+          echo "--- ELF LOAD alignment (16 KB = 0x4000 is needed for Android 15+ 16KB devices) ---"
+          for f in so/libai-chat.so so/libllama.so; do
+            echo "$f: $("$LLVM/bin/llvm-readelf" -lW "$f" 2>/dev/null | awk '$1=="LOAD"{print $NF}' | sort -u | tr '\n' ' ')"
+          done
+          exit 0
+
+      # Lint's NewApi check reports Kotlin/Java calls to APIs newer than Android 10.
+      # Informational only: warnings, never fails the build.
+      - name: Lint for APIs newer than Android 10
+        continue-on-error: true
+        shell: bash
+        run: |
+          cd "$PROJECT_DIR"
+          gradle --no-daemon :app:lintDebug > "$GITHUB_WORKSPACE/lint.log" 2>&1 || true
+          tail -n 5 "$GITHUB_WORKSPACE/lint.log"
+          python3 - <<'PY'
+          import os, glob
+          import xml.etree.ElementTree as ET
+          found = 0
+          for f in glob.glob('app/build/reports/lint-results-debug.xml'):
+              for i in ET.parse(f).getroot().iter('issue'):
+                  if i.get('id') in ('NewApi', 'InlinedApi', 'ObsoleteSdkInt') and i.get('severity') in ('Error', 'Fatal', 'Warning'):
+                      if i.get('id') == 'ObsoleteSdkInt':
+                          continue
+                      loc = i.find('location')
+                      where = (loc.get('file', '?').split('/app/')[-1] + ':' + loc.get('line', '?')) if loc is not None else '?'
+                      print('::warning::[%s] %s (%s)' % (i.get('id'), i.get('message'), where))
+                      found += 1
+          print('API>29 findings:', found)
+          PY
+
+      - name: Create Termux download helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          cat > get-vethos.sh <<'SCRIPT'
+          #!/bin/sh
+          BASE="https://github.com/@REPO@/releases/download/@TAG@"
+          APK="@APK@"
+          fetch() {
+            n=0
+            until wget -c -T 30 -q --show-progress "$BASE/$1"; do
+              n=$((n+1)); [ "$n" -ge 30 ] && return 1
+              echo "retry $n ..."; sleep 3
+            done
+          }
+          fetch "$APK.sha256" || { echo "hash file nahi mili"; exit 1; }
+          i=0
+          while [ "$i" -lt 5 ]; do
+            fetch "$APK" && sha256sum -c "$APK.sha256" && { echo "OK: $APK verified"; exit 0; }
+            rm -f "$APK"; i=$((i+1))
+          done
+          echo "Tukdon se download kar raha hoon ..."
+          rm -f parts.sha256
+          fetch parts.sha256 || exit 1
+          while read -r h f; do
+            n=0
+            until [ -f "$f" ] && echo "$h  $f" | sha256sum -c - >/dev/null 2>&1; do
+              rm -f "$f"; n=$((n+1)); [ "$n" -gt 15 ] && exit 1
+              fetch "$f" </dev/null || exit 1
+            done
+          done < parts.sha256
+          cat "$APK".part* > "$APK"
+          sha256sum -c "$APK.sha256"
+          SCRIPT
+          # YAML already removed the block indent; nothing else to strip
+          sed -i "s|@REPO@|${GITHUB_REPOSITORY}|; s|@TAG@|vethos-build-${GITHUB_RUN_NUMBER}|; s|@APK@|${APK_NAME}|" get-vethos.sh
+          chmod +x get-vethos.sh
+          sh -n get-vethos.sh
 
       - name: Write release notes
         shell: bash
         run: |
           {
-            echo "ReCode (Harness) debug build ${GITHUB_RUN_NUMBER}"
+            echo "Vethos debug build ${GITHUB_RUN_NUMBER}"
             echo
+            echo "- Android 10+ (minSdk ${APK_MINSDK}), arm64-v8a only"
+            echo "- llama.cpp ref: ${LLAMA_REF} (commit ${LLAMA_SHA})"
+            echo "- NDK ${NDK_VERSION}"
             echo "- SHA256: $(cut -d' ' -f1 "dist/$APK_NAME.sha256")"
           } > release-notes.md
+          cat release-notes.md
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: ReCode-debug
+          name: Vethos-debug
           path: dist/
           retention-days: 14
           if-no-files-found: error
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
-          tag_name: recode-build-${{ github.run_number }}
-          name: ReCode debug build ${{ github.run_number }}
+          tag_name: vethos-build-${{ github.run_number }}
+          name: Vethos debug build ${{ github.run_number }}
           body_path: release-notes.md
           prerelease: true
           fail_on_unmatched_files: true
           files: |
-            dist/ReCode-debug.apk
-            dist/ReCode-debug.apk.sha256
+            dist/Vethos-debug.apk
+            dist/Vethos-debug.apk.sha256
+            dist/Vethos-debug.zip
+            dist/Vethos-debug.apk.part*
+            dist/parts.sha256
+            dist/get-vethos.sh
+
+      - name: Verify release download checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="vethos-build-${GITHUB_RUN_NUMBER}"
+          for i in 1 2 3 4 5; do
+            rm -rf check && mkdir check
+            if gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+              -p "$APK_NAME" -p "$APK_NAME.sha256" -D check \
+              && (cd check && sha256sum -c "$APK_NAME.sha256"); then
+              echo "Release round-trip checksum OK"; exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Release APK checksum verification failed"
+          exit 1
+
+      - name: Job summary
+        shell: bash
+        run: |
+          TAG="vethos-build-${GITHUB_RUN_NUMBER}"
+          HASH=$(cut -d' ' -f1 "dist/$APK_NAME.sha256")
+          {
+            echo '## Vethos APK ready'
+            echo
+            echo "minSdk ${APK_MINSDK} (Android 10+) | arm64-v8a | llama.cpp ${LLAMA_REF} @ ${LLAMA_SHA} | NDK ${NDK_VERSION}"
+            echo
+            echo "SHA256: $HASH"
+            echo
+            echo "Signing key: ${APK_SIGNER:-unknown} (must stay the same between builds to install as an update)"
+            echo
+            echo "Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
+            echo
+            echo 'Termux:'
+            echo '```sh'
+            echo 'pkg install wget -y'
+            echo "wget https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/get-vethos.sh"
+            echo 'sh get-vethos.sh'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Show useful build errors
         if: failure()
         shell: bash
         run: |
           [[ -f build.log ]] || exit 0
-          grep -nE 'error:|^e: |FAILED|What went wrong|CMake Error|undefined reference' build.log \
-            | cut -c1-260 | head -40 > first-errors.txt || true
+          # first real compiler/linker errors, long command lines cut short
+          grep -nE 'error:|fatal error|undefined reference|undeclared|FAILED:|What went wrong|CMake Error' build.log \
+            | grep -v 'Werror' | cut -c1-260 | head -40 > first-errors.txt || true
           cat first-errors.txt
-          { echo '## Build failed - first errors'; echo '```'; cat first-errors.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo '## Build failed - first errors'
+            echo '```'
+            cat first-errors.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload build log
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: build-log
           path: |
             build.log
             first-errors.txt
+            badging.txt
+            manifest-tree.txt
           retention-days: 7
           if-no-files-found: ignore
