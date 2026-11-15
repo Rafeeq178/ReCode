@@ -6,7 +6,7 @@ on:
     branches: [main, master]
 
 env:
-  LLAMA_REF: b11982            # pinned llama.cpp tag (LFM3 needs b11960+); falls back to master if the tag does not exist
+  LLAMA_REF: b11976            # pinned llama.cpp tag (must be b11960 or newer: LFM3 models need the lfm3 architecture); falls back to master if the tag does not exist
   NDK_VERSION: 29.0.13113456   # default only; the llama.cpp lib's own ndkVersion wins if it has one
   CMAKE_VERSION: 3.31.6        # default only; the lib's own cmake version wins if it has one
   MIN_SDK: '29'                # Android 10
@@ -95,40 +95,15 @@ jobs:
           fi
           git -C "$DEST" log -1 --oneline
           echo "LLAMA_SHA=$(git -C "$DEST" rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
+          # LFM3 GGUFs fail with "unknown model architecture: lfm3" on older llama.cpp, so stop early
+          grep -rqi "lfm3" "$DEST/src" || {
+            echo "::error::llama.cpp ref $LLAMA_REF has no LFM3 support. Use b11960 or newer (or master)."
+            exit 1
+          }
           test -f "$DEST/examples/llama.android/lib/build.gradle.kts" || {
             echo "::error::This llama.cpp ref has no examples/llama.android/lib module. Set LLAMA_REF to a newer tag or master."
             exit 1
           }
-
-      - name: Export llama.cpp lib source for review (non-blocking)
-        shell: bash
-        continue-on-error: true
-        run: |
-          python3 - <<'EOF'
-          import os, zipfile, pathlib
-          root = pathlib.Path(os.environ['PROJECT_DIR']) / 'llama.cpp'
-          out = pathlib.Path(os.environ['GITHUB_WORKSPACE']) / 'llama-lib-source.zip'
-          want = ['examples/llama.android/lib/src', 'examples/llama.android/lib/build.gradle.kts', 'tools/mtmd']
-          n = 0
-          with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
-              for w in want:
-                  base = root / w
-                  files = [base] if base.is_file() else [f for f in base.rglob('*') if f.is_file()]
-                  for f in files:
-                      if f.suffix.lower() in ('.cpp', '.h', '.hpp', '.kt', '.kts', '.txt', '.md', '.cmake', '.c', '.cc'):
-                          z.write(f, str(f.relative_to(root)))
-                          n += 1
-          print('exported files:', n, 'size:', out.stat().st_size)
-          EOF
-
-      - name: Upload lib source artifact (non-blocking)
-        continue-on-error: true
-        uses: actions/upload-artifact@v7
-        with:
-          name: llama-lib-source
-          path: llama-lib-source.zip
-          retention-days: 14
-          if-no-files-found: ignore
 
       - name: Prepare llama.cpp Android lib
         shell: bash
