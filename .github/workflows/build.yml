@@ -6,7 +6,7 @@ on:
     branches: [main, master]
 
 env:
-  LLAMA_REF: b11976            # pinned llama.cpp tag (must be b11960 or newer: LFM3 models need the lfm3 architecture); falls back to master if the tag does not exist
+  LLAMA_REF: v1.0.0            # pinned llama.cpp release (13 Nov 2026, semver; LFM3 support needs b11960 or newer); falls back to master if the tag does not exist
   NDK_VERSION: 29.0.13113456   # default only; the llama.cpp lib's own ndkVersion wins if it has one
   CMAKE_VERSION: 3.31.6        # default only; the lib's own cmake version wins if it has one
   MIN_SDK: '29'                # Android 10
@@ -26,7 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # Builds the HIGHEST-version zip in the repo (Vethos_v8.zip beats Vethos_v5.zip) after unzipping it into a
+      # Builds the HIGHEST-version zip in the repo (Vethos_v13.zip beats Vethos_v9.zip) after unzipping it into a
       # brand-new folder, so files left over from older versions can never get mixed in.
       # If the repo has no zip at all, the project folder that is already in the repo is used.
       - name: Locate project
@@ -96,8 +96,8 @@ jobs:
           git -C "$DEST" log -1 --oneline
           echo "LLAMA_SHA=$(git -C "$DEST" rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
           # LFM3 GGUFs fail with "unknown model architecture: lfm3" on older llama.cpp, so stop early
-          grep -rqi "lfm3" "$DEST/src" || {
-            echo "::error::llama.cpp ref $LLAMA_REF has no LFM3 support. Use b11960 or newer (or master)."
+          grep -rqi "lfm3" "$DEST/src" "$DEST/include" 2>/dev/null || {
+            echo "::error::llama.cpp ref $LLAMA_REF has no LFM3 support. Use v1.0.0, b11960 or newer (or master)."
             exit 1
           }
           test -f "$DEST/examples/llama.android/lib/build.gradle.kts" || {
