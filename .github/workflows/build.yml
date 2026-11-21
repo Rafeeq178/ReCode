@@ -73,6 +73,7 @@ jobs:
           # Optional. When unset, the newest aarch64 proot and libtalloc are taken from the Termux package index.
           PROOT_DEB_URL: ${{ vars.PROOT_DEB_URL }}
           TALLOC_DEB_URL: ${{ vars.TALLOC_DEB_URL }}
+          SHMEM_DEB_URL: ${{ vars.SHMEM_DEB_URL }}
         run: |
           set -euo pipefail
           sudo apt-get install -y --no-install-recommends patchelf binutils >/dev/null
@@ -120,14 +121,27 @@ jobs:
             patchelf --set-rpath '$ORIGIN' "$JNI/libproot.so"
           fi
 
+          # Newer Termux proot builds also link libandroid-shmem.so (System V shm emulation), which is not part
+          # of Android. It is already named lib*.so, so it is bundled as-is next to libproot.so.
+          if readelf -d "$JNI/libproot.so" | grep -q 'libandroid-shmem'; then
+            extract_deb "${SHMEM_DEB_URL:-$(termux_deb_url libandroid-shmem)}" shmem_pkg
+            SRC=$(find shmem_pkg/data -name 'libandroid-shmem.so*' | head -n1)
+            [ -n "$SRC" ] || { echo "libandroid-shmem not found in its .deb"; exit 1; }
+            cp -L "$SRC" "$JNI/libandroid-shmem.so"
+            chmod 755 "$JNI/libandroid-shmem.so"
+            patchelf --set-soname libandroid-shmem.so "$JNI/libandroid-shmem.so"
+            patchelf --set-rpath '$ORIGIN' "$JNI/libandroid-shmem.so"
+            patchelf --set-rpath '$ORIGIN' "$JNI/libproot.so"
+          fi
+
           # Fail the build now, not on the phone, if anything outside the Android system is still required.
           echo "--- readelf -d libproot.so (after) ---"
           readelf -d "$JNI/libproot.so" | grep -E 'NEEDED|RUNPATH|RPATH' || true
-          for lib in "$JNI/libproot.so" "$JNI/libtalloc.so"; do
+          for lib in "$JNI/libproot.so" "$JNI/libtalloc.so" "$JNI/libandroid-shmem.so"; do
             [ -f "$lib" ] || continue
             for need in $(readelf -d "$lib" | awk '/NEEDED/{gsub(/[\[\]]/,"",$NF); print $NF}'); do
               case "$need" in
-                libc.so|libm.so|libdl.so|liblog.so|libz.so|libtalloc.so) ;;
+                libc.so|libm.so|libdl.so|liblog.so|libz.so|libtalloc.so|libandroid-shmem.so) ;;
                 *) echo "ERROR: $(basename "$lib") needs $need, which is not on Android and is not bundled."; exit 1 ;;
               esac
             done
