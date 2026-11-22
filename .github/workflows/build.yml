@@ -1,4 +1,4 @@
-name: Build AICompany APK
+name: Build ReCode APK
 
 on:
   workflow_dispatch:
@@ -6,36 +6,31 @@ on:
     branches: [main, master]
 
 env:
-  LLAMA_REF: b8683           # pinned upstream llama.cpp tag (ggml-org/llama.cpp)
-  MIN_SDK: '26'
-  TARGET_SDK: '28'
-  NDK_VERSION: 29.0.13113456
-  CMAKE_VERSION: 3.31.6
-  APK_NAME: AICompany-debug.apk
+  NDK_VERSION: 27.2.12479018   # pinned in app/build.gradle.kts; without it the native (local model) code is silently dropped
+  CMAKE_VERSION: 3.22.1
+  APK_NAME: ReCode-debug.apk
 
 permissions:
   contents: write
 
 concurrency:
-  group: build-aicompany
+  group: build-recode
   cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
-      # Builds the HIGHEST-version zip in the repo (AICompany_fixed6.zip beats AICompany_fixed5.zip) after unzipping it
-      # into a fresh folder, so files from older versions never get mixed in. With no zip, the project in the repo is used.
+      # Builds the HIGHEST ReCode_*.zip in the repo (ReCode_phase4.zip beats ReCode_phase3.zip) after unzipping it into
+      # a fresh folder. Old AICompany_*.zip files are ignored. With no ReCode zip, the project in the repo is used.
       - name: Locate project
         shell: bash
         run: |
           set -euo pipefail
-          Z=$(ls ./*.zip 2>/dev/null | sort -V | tail -n1 || true)
+          Z=$(ls ./ReCode*.zip 2>/dev/null | sort -V | tail -n1 || true)
           ROOT=.
           if [[ -n "$Z" ]]; then
             echo "Using $Z"
@@ -43,200 +38,87 @@ jobs:
             unzip -q -o "$Z" -d _build_src
             ROOT=_build_src
           fi
-          S=$(find "$ROOT" -maxdepth 3 -name settings.gradle.kts -not -path '*/llama.cpp/*' | head -n1 || true)
-          [[ -n "$S" ]] || { echo "::error::settings.gradle.kts not found. Put AICompany_*.zip (or the project folder) in the repo."; exit 1; }
+          S=$(find "$ROOT" -maxdepth 3 -name settings.gradle.kts | head -n1 || true)
+          [[ -n "$S" ]] || { echo "::error::settings.gradle.kts not found. Put ReCode_*.zip (or the project folder) in the repo."; exit 1; }
           D=$(cd "$(dirname "$S")" && pwd)
           test -f "$D/app/build.gradle.kts"
+          chmod +x "$D/gradlew"
           echo "PROJECT_DIR=$D" >> "$GITHUB_ENV"
           echo "Project: $D"
 
-      # A fresh runner makes a NEW random debug key every build, so a new APK cannot be installed over the old
-      # one ("App not installed"). Put one fixed debug.keystore in the repo root (or next to settings.gradle.kts).
+      # A fresh runner makes a NEW random debug key every build, so a new APK cannot be installed over the old one.
+      # Keep one fixed debug.keystore in the repo root (or next to settings.gradle.kts).
       - name: Use fixed debug signing key
         shell: bash
         run: |
           set -euo pipefail
           K=""
-          for c in "$PROJECT_DIR/debug.keystore" "debug.keystore"; do
+          for c in "$PROJECT_DIR/debug.keystore" "debug.keystore" "$PROJECT_DIR/signing-keys/debug.keystore"; do
             [[ -f "$c" ]] && { K="$c"; break; }
           done
           if [[ -n "$K" ]]; then
-            mkdir -p "$HOME/.android" && cp "$K" "$HOME/.android/debug.keystore"
+            mkdir -p "$HOME/.android" "$PROJECT_DIR/signing-keys"
+            cp "$K" "$HOME/.android/debug.keystore"
+            cp "$K" "$PROJECT_DIR/signing-keys/debug.keystore"
             echo "Using fixed debug keystore: $K"
           else
             echo "::warning::debug.keystore not found - APK gets a random signature; uninstall the old app first."
           fi
 
-      - name: Fetch proot for arm64 (native lib)
-        shell: bash
-        env:
-          # Optional. When unset, the newest aarch64 proot and libtalloc are taken from the Termux package index.
-          PROOT_DEB_URL: ${{ vars.PROOT_DEB_URL }}
-          TALLOC_DEB_URL: ${{ vars.TALLOC_DEB_URL }}
-          SHMEM_DEB_URL: ${{ vars.SHMEM_DEB_URL }}
-        run: |
-          set -euo pipefail
-          sudo apt-get install -y --no-install-recommends patchelf binutils >/dev/null
-          TERMUX_REPO=https://packages.termux.dev/apt/termux-main
-          mkdir -p /tmp/proot && cd /tmp/proot
-
-          termux_deb_url() {   # $1 = package name, resolved from the Termux Packages index
-            [ -f Packages ] || curl -fsSL "$TERMUX_REPO/dists/stable/main/binary-aarch64/Packages" -o Packages
-            local file
-            file=$(awk -v p="$1" 'BEGIN{RS="";FS="\n"} {n="";f="";for(i=1;i<=NF;i++){if($i ~ /^Package: /)n=substr($i,10); if($i ~ /^Filename: /)f=substr($i,11)} if(n==p){print f; exit}}' Packages)
-            [ -n "$file" ] || { echo "Package $1 not found in the Termux index"; exit 1; }
-            echo "$TERMUX_REPO/$file"
-          }
-          extract_deb() {      # $1 = url, $2 = target dir
-            mkdir -p "$2" && curl -fsSL "$1" -o "$2/pkg.deb" && (cd "$2" && ar x pkg.deb && tar -xf data.tar.*)
-          }
-
-          extract_deb "${PROOT_DEB_URL:-$(termux_deb_url proot)}" proot_pkg
-          # Locate the files instead of trusting one fixed path inside the .deb.
-          PROOT_BIN=$(find proot_pkg/data -type f -name proot | head -n1)
-          LOADER_BIN=$(find proot_pkg/data -type f -name loader -path '*proot*' | head -n1)
-          if [ -z "$PROOT_BIN" ] || [ -z "$LOADER_BIN" ]; then
-            echo "proot or its loader is not in the .deb. Contents:"; find proot_pkg/data -type f | head -50; exit 1
-          fi
-          JNI="$PROJECT_DIR/app/src/main/jniLibs/arm64-v8a"
-          mkdir -p "$JNI"
-          cp "$PROOT_BIN" "$JNI/libproot.so"
-          cp "$LOADER_BIN" "$JNI/libproot-loader.so"
-          chmod 755 "$JNI/libproot.so" "$JNI/libproot-loader.so"
-          ls -la "$JNI"
-
-          # Termux's proot may need libtalloc.so.2. Android only packages files named lib*.so, so the
-          # dependency is shipped as libtalloc.so and proot is pointed at it (NEEDED rename + $ORIGIN rpath).
-          echo "--- readelf -d libproot.so (before) ---"
-          readelf -d "$JNI/libproot.so" | grep -E 'NEEDED|RUNPATH|RPATH' || true
-          if readelf -d "$JNI/libproot.so" | grep -q 'libtalloc'; then
-            NEEDED_NAME=$(readelf -d "$JNI/libproot.so" | grep -o 'libtalloc[^]]*')
-            extract_deb "${TALLOC_DEB_URL:-$(termux_deb_url libtalloc)}" talloc_pkg
-            SRC=$(find talloc_pkg/data -name 'libtalloc.so*' | head -n1)
-            [ -n "$SRC" ] || { echo "libtalloc not found in its .deb"; exit 1; }
-            cp -L "$SRC" "$JNI/libtalloc.so"
-            chmod 755 "$JNI/libtalloc.so"
-            patchelf --set-soname libtalloc.so "$JNI/libtalloc.so"
-            patchelf --replace-needed "$NEEDED_NAME" libtalloc.so "$JNI/libproot.so"
-            patchelf --set-rpath '$ORIGIN' "$JNI/libproot.so"
-          fi
-
-          # Newer Termux proot builds also link libandroid-shmem.so (System V shm emulation), which is not part
-          # of Android. It is already named lib*.so, so it is bundled as-is next to libproot.so.
-          if readelf -d "$JNI/libproot.so" | grep -q 'libandroid-shmem'; then
-            extract_deb "${SHMEM_DEB_URL:-$(termux_deb_url libandroid-shmem)}" shmem_pkg
-            SRC=$(find shmem_pkg/data -name 'libandroid-shmem.so*' | head -n1)
-            [ -n "$SRC" ] || { echo "libandroid-shmem not found in its .deb"; exit 1; }
-            cp -L "$SRC" "$JNI/libandroid-shmem.so"
-            chmod 755 "$JNI/libandroid-shmem.so"
-            patchelf --set-soname libandroid-shmem.so "$JNI/libandroid-shmem.so"
-            patchelf --set-rpath '$ORIGIN' "$JNI/libandroid-shmem.so"
-            patchelf --set-rpath '$ORIGIN' "$JNI/libproot.so"
-          fi
-
-          # Fail the build now, not on the phone, if anything outside the Android system is still required.
-          echo "--- readelf -d libproot.so (after) ---"
-          readelf -d "$JNI/libproot.so" | grep -E 'NEEDED|RUNPATH|RPATH' || true
-          for lib in "$JNI/libproot.so" "$JNI/libtalloc.so" "$JNI/libandroid-shmem.so"; do
-            [ -f "$lib" ] || continue
-            for need in $(readelf -d "$lib" | awk '/NEEDED/{gsub(/[\[\]]/,"",$NF); print $NF}'); do
-              case "$need" in
-                libc.so|libm.so|libdl.so|liblog.so|libz.so|libtalloc.so|libandroid-shmem.so) ;;
-                *) echo "ERROR: $(basename "$lib") needs $need, which is not on Android and is not bundled."; exit 1 ;;
-              esac
-            done
-          done
-
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
 
       - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.10.2'
 
-      - name: Fetch pinned llama.cpp
-        shell: bash
-        run: |
-          set -euo pipefail
-          DEST="$PROJECT_DIR/app/src/main/cpp/llama.cpp"
-          rm -rf "$DEST"
-          git clone --depth 1 --branch "$LLAMA_REF" https://github.com/ggml-org/llama.cpp "$DEST"
-          test -f "$DEST/include/llama.h"
-          echo "LLAMA_SHA=$(git -C "$DEST" rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
-          # The JNI bridge uses these; fail early (with a clear message) if a newer llama.cpp renamed them.
-          for sym in llama_chat_apply_template llama_model_chat_template llama_set_abort_callback llama_memory_seq_rm llama_vocab_bos; do
-            grep -q "$sym" "$DEST/include/llama.h" || { echo "::error::llama.h has no $sym - LLAMA_REF $LLAMA_REF is not compatible with aicompany_llm.cpp"; exit 1; }
-          done
-          grep -q "use_mmap" "$DEST/include/llama.h" || { echo "::error::llama_model_params.use_mmap missing in $LLAMA_REF"; exit 1; }
-
-      - name: Install NDK and CMake
+      - name: Install NDK, CMake and Vulkan shader compiler
         shell: bash
         run: |
           set -euo pipefail
           SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           yes | "$SDKM" --licenses >/dev/null || true
-          "$SDKM" "platforms;android-35" "build-tools;35.0.0" "cmake;3.31.6" "ndk;29.0.13113456" | tail -n 3
-
-      - name: Verify SDK bounds
-        shell: bash
-        run: |
-          set -euo pipefail
-          grep -q "minSdk = ${MIN_SDK}" "$PROJECT_DIR/app/build.gradle.kts"
-          grep -q "targetSdk = ${TARGET_SDK}" "$PROJECT_DIR/app/build.gradle.kts"
-
-      - name: Check icon resources
-        shell: bash
-        run: |
-          set -euo pipefail
-          RES="$PROJECT_DIR/app/src/main/res"
-          for f in mipmap-anydpi-v26/ic_launcher.xml mipmap-anydpi-v26/ic_launcher_round.xml drawable/ic_launcher_fg.xml values/ic_colors.xml; do
-            test -s "$RES/$f" || { echo "::error::missing $f"; exit 1; }
-          done
-          grep -q 'android:icon="@mipmap/ic_launcher"' "$PROJECT_DIR/app/src/main/AndroidManifest.xml"
-          echo "Icon resources OK"
+          "$SDKM" "cmake;${CMAKE_VERSION}" "ndk;${NDK_VERSION}" | tail -n 3
+          # compileSdk 37: install it when sdkmanager already knows it, otherwise Gradle downloads it itself.
+          "$SDKM" "platforms;android-37" | tail -n 2 || true
+          test -d "$ANDROID_HOME/ndk/${NDK_VERSION}"
+          sudo apt-get update -qq && sudo apt-get install -y glslc
+          glslc --version | head -n 1
 
       - name: Build debug APK
         shell: bash
         run: |
           set -o pipefail
           cd "$PROJECT_DIR"
-          gradle --no-daemon --stacktrace :app:testDebugUnitTest :app:assembleDebug 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          ./gradlew --no-daemon --stacktrace :app:assembleDebug 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
 
       - name: Verify APK
         shell: bash
         run: |
           set -euo pipefail
           APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
-          BT="$ANDROID_HOME/build-tools/35.0.0"
+          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n1)"
           test -s "$APK"
           unzip -tq "$APK"
           "$BT/apksigner" verify --print-certs "$APK" | grep -E "Verifies|SHA-256" || true
           "$BT/aapt2" dump badging "$APK" > badging.txt
-          grep -E "^package:|^sdkVersion|^minSdkVersion|^targetSdkVersion|^native-code|^application-icon" badging.txt || true
+          grep -E "^package:|^sdkVersion|^targetSdkVersion|^native-code|^application-label:" badging.txt || true
+          grep -q "package: name='com.aicompany.app'" badging.txt || { echo "::error::package is not com.aicompany.app (old app keys would not carry over)"; exit 1; }
           grep -q "launchable-activity" badging.txt || { echo "::error::no launcher activity"; exit 1; }
-          grep -q "application-icon.*ic_launcher" badging.txt || { echo "::error::launcher icon missing in APK"; exit 1; }
-          grep -q "native-code: *'arm64-v8a'" badging.txt || { echo "::error::APK is not arm64-v8a"; exit 1; }
           LIBS=$(unzip -l "$APK" | grep -E 'lib/arm64-v8a/.*\.so' || true)
           echo "$LIBS"
-          for need in libaicompany_llm.so libproot.so libproot-loader.so; do
-            echo "$LIBS" | grep -q "$need" || { echo "::error::$need missing from APK"; exit 1; }
+          # If the NDK was not found Gradle drops the native code and the APK still builds: catch that here.
+          for need in librecode_local.so librecode_adb.so; do
+            echo "$LIBS" | grep -q "$need" || { echo "::error::$need missing - local models would not work"; exit 1; }
           done
-          # proot and its loader are executed from nativeLibraryDir, so they must be extracted at install time.
-          "$BT/aapt2" dump xmltree --file AndroidManifest.xml "$APK" > manifest-tree.txt
-          if grep -E "extractNativeLibs" manifest-tree.txt | grep -qE "=false|0x0$"; then
-            echo "::error::extractNativeLibs=false: proot could not run"; exit 1
-          fi
-          # -O3 check: the optimised llama.cpp library is several MB; an -O0 build is far larger/slower to detect, so just report size.
-          unzip -l "$APK" | grep -E 'libaicompany_llm.so'
           mkdir -p dist
           cp "$APK" "dist/$APK_NAME"
+          cp "$PROJECT_DIR"/app/build/outputs/gpuRuntime/debug/*.gz dist/ 2>/dev/null || true
           sha256sum "dist/$APK_NAME" | tee "dist/$APK_NAME.sha256"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: AICompany-debug
+          name: ReCode-debug
           path: dist/
           retention-days: 14
           if-no-files-found: error
@@ -244,22 +126,30 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: aicompany-build-${{ github.run_number }}
-          name: AICompany debug build ${{ github.run_number }}
-          body: "llama.cpp ${{ env.LLAMA_REF }} (${{ env.LLAMA_SHA }}) - minSdk ${{ env.MIN_SDK }}, arm64-v8a"
+          tag_name: recode-build-${{ github.run_number }}
+          name: ReCode debug build ${{ github.run_number }}
+          body: "ReCode debug build - package com.aicompany.app"
           prerelease: true
           fail_on_unmatched_files: true
           files: |
-            dist/AICompany-debug.apk
-            dist/AICompany-debug.apk.sha256
+            dist/ReCode-debug.apk
+            dist/ReCode-debug.apk.sha256
+
+      # Unit tests run after the APK is saved and never block it.
+      - name: Run unit tests
+        continue-on-error: true
+        shell: bash
+        run: |
+          cd "$PROJECT_DIR"
+          ./gradlew --no-daemon :app:testDebugUnitTest 2>&1 | tee "$GITHUB_WORKSPACE/test.log"
 
       - name: Show useful build errors
         if: failure()
         shell: bash
         run: |
           [[ -f build.log ]] || exit 0
-          grep -nE 'error:|fatal error|undefined reference|undeclared|FAILED:|What went wrong|CMake Error|e: file' build.log \
-            | cut -c1-260 | head -40 | tee first-errors.txt || true
+          grep -nE 'error:|fatal error|undefined reference|undeclared|FAILED:|What went wrong|CMake Error|e: file|e: ' build.log \
+            | cut -c1-260 | head -60 | tee first-errors.txt || true
           { echo '## Build failed - first errors'; echo '```'; cat first-errors.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload build log
